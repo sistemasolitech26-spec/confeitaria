@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: confeitaria-olitech
+    env: node
+    plan: free
+    buildCommand: npm install --package-lock=false --omit=dev --no-audit --no-fund
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.20.2
+      - key: NPM_CONFIG_PACKAGE_LOCK
+        value: "false"
+      - key: NPM_CONFIG_AUDIT
+        value: "false"
+      - key: NPM_CONFIG_FUND
+        value: "false"
