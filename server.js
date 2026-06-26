@@ -4,6 +4,7 @@ const cors=require('cors');
 const bcrypt=require('bcryptjs');
 const multer=require('multer');
 const pdfParse=require('pdf-parse');
+const AdmZip=require('adm-zip');
 const {createClient}=require('@supabase/supabase-js');
 const app=express();
 app.use(cors()); app.use(express.json({limit:'50mb'})); app.use(express.static('public'));
@@ -20,7 +21,7 @@ async function getConfig(chave){ if(!supabase) return null; const r=await supaba
 async function setConfig(chave,valor){ const r=await supabase.from('configuracoes').upsert({chave,valor},{onConflict:'chave'}).select().single(); if(r.error) throw r.error; return r.data; }
 async function evo(){ const cfg=await getConfig('whatsapp'); return {url:cfg?.url||process.env.EVOLUTION_API_URL||'', apiKey:cfg?.apiKey||process.env.EVOLUTION_API_KEY||'', instance:cfg?.instance||process.env.EVOLUTION_INSTANCE||'confeitaria'}; }
 async function evoFetch(path,opt={}){ const c=await evo(); if(!c.url||!c.apiKey||!c.instance) throw new Error('Configure WhatsApp em CONFIGURAÇÕES > WHATSAPP.'); const url=c.url.replace(/\/$/,'')+path.replace('{instance}',encodeURIComponent(c.instance)); const r=await fetch(url,{...opt,headers:{'Content-Type':'application/json','apikey':c.apiKey,...(opt.headers||{})}}); const txt=await r.text(); let data; try{data=JSON.parse(txt)}catch{data=txt} if(!r.ok) throw new Error(typeof data==='string'?data:(data.message||data.error||'Erro Evolution API')); return data; }
-app.get('/api/health',(_,res)=>ok(res,{app:'CONFEITARIA OLITECH ERP',version:'5.5.0',supabase:!!supabase}));
+app.get('/api/health',(_,res)=>ok(res,{app:'CONFEITARIA OLITECH ERP',version:'5.8.0',supabase:!!supabase}));
 app.post('/api/login',async(req,res)=>{try{if(!db(res))return; const {usuario,senha}=req.body; const {data,error}=await supabase.from('usuarios').select('*').eq('usuario',String(usuario||'').toLowerCase()).eq('ativo',true).maybeSingle(); if(error)throw error; if(!data)return fail(res,'Usuário não encontrado ou bloqueado.',401); const hashOk=data.senha_hash?await bcrypt.compare(senha,data.senha_hash):false; const legacyOk=!data.senha_hash&&data.senha===senha; if(!hashOk&&!legacyOk)return fail(res,'Senha inválida.',401); ok(res,{id:data.id,nome:data.nome,usuario:data.usuario,perfil:data.perfil,permissoes:data.permissoes||{todas:data.perfil==='admin'}})}catch(e){fail(res,e)}});
 app.get('/api/:table',async(req,res)=>{try{if(!db(res))return; const t=req.params.table; if(t==='formas-pagamento-v2'){ const c=await getConfig('formas_pagamento'); let formas=c?.formas||defaultFormasPagamento(); formas=formas.map(normForma); return ok(res,formas); } if(t==='formas-pagamento'){ const c=await getConfig('formas_pagamento'); return ok(res,c?.formas||['DINHEIRO','PIX','DÉBITO','CRÉDITO','CREDIÁRIO']); } if(!allowed.includes(t))return fail(res,'Tabela inválida',400); let q=supabase.from(t).select('*').order('created_at',{ascending:false}); const busca=(req.query.busca||'').trim(); if(busca&&searchCols[t]) q=q.ilike(searchCols[t],`%${busca}%`); const {data,error}=await q.limit(Number(req.query.limit||1000)); if(error)throw error; ok(res,data)}catch(e){fail(res,e)}});
 app.post('/api/:table',async(req,res)=>{try{if(!db(res))return; const t=req.params.table; if(t==='formas-pagamento-v2'){ let formas=(req.body.formas||[]).map(normForma).filter(f=>f.nome); if(!formas.length) formas=defaultFormasPagamento(); return ok(res,await setConfig('formas_pagamento',{formas})); } if(t==='formas-pagamento'){ let formas=(req.body.formas||[]).map(upper).filter(Boolean); if(!formas.length) formas=['DINHEIRO','PIX','DÉBITO','CRÉDITO','CREDIÁRIO']; return ok(res,await setConfig('formas_pagamento',{formas})); } if(!allowed.includes(t))return fail(res,'Tabela inválida',400); let body=normalize(req.body||{}); if(t==='usuarios'&&body.senha){body.usuario=String(body.usuario||'').toLowerCase(); body.senha_hash=await bcrypt.hash(body.senha,10); delete body.senha} if(t==='produtos') calcProduto(body); const {data,error}=await supabase.from(t).upsert(body).select().single(); if(error)throw error; ok(res,data)}catch(e){fail(res,e)}});
@@ -46,17 +47,103 @@ app.post('/api/backup/restaurar',upload.single('backup'),async(req,res)=>{try{if
 function onlyDigits(v){return String(v||'').replace(/\D/g,'')}
 function csvEscape(v){v=v==null?'':String(v); return /[;"\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v}
 function parseCSV(txt){
-  const lines=txt.replace(/^\uFEFF/,'').split(/\r?\n/).filter(l=>l.trim());
+  txt=String(txt||'').replace(/^\uFEFF/,'');
+  const lines=txt.split(/\r?\n/).filter(l=>l.trim());
   if(!lines.length) return [];
-  const sep=lines[0].includes(';')?';':',';
+  const sep=(lines[0].match(/;/g)||[]).length >= (lines[0].match(/,/g)||[]).length ? ';' : ',';
   const head=lines[0].split(sep).map(h=>h.trim().toLowerCase());
   return lines.slice(1).map(line=>{const cols=line.split(sep); const o={}; head.forEach((h,i)=>o[h]=cols[i]||''); return o;});
+}
+function decodeQP(s){
+  if(!s) return '';
+  try{
+    s=String(s).replace(/=\r?\n/g,'');
+    const bytes=[];
+    for(let i=0;i<s.length;i++){
+      if(s[i]==='='&&/[0-9A-Fa-f]{2}/.test(s.slice(i+1,i+3))){bytes.push(parseInt(s.slice(i+1,i+3),16)); i+=2;}
+      else bytes.push(s.charCodeAt(i));
+    }
+    return Buffer.from(bytes).toString('utf8');
+  }catch{return String(s).replace(/=([0-9A-Fa-f]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16)));}
+}
+function decodeTextBuffer(buf){
+  if(!Buffer.isBuffer(buf)) return String(buf||'');
+  if(buf.length>=2 && buf[0]===0xff && buf[1]===0xfe) return buf.toString('utf16le');
+  if(buf.length>=2 && buf[0]===0xfe && buf[1]===0xff) return buf.swap16().toString('utf16le');
+  let t=buf.toString('utf8');
+  const bad=(t.match(/�/g)||[]).length;
+  if(bad>10) t=buf.toString('latin1');
+  return t;
+}
+function unfoldVcf(txt){
+  return String(txt||'')
+    .replace(/^\uFEFF/,'')
+    .replace(/\r\n[ \t]/g,'')
+    .replace(/\n[ \t]/g,'')
+    .replace(/=\r?\n/g,'');
+}
+function cleanVcfValue(line){
+  let idx=line.indexOf(':'); if(idx<0) return '';
+  let meta=line.slice(0,idx).toUpperCase();
+  let val=line.slice(idx+1).replace(/\\n/g,' ').replace(/\\,/g,',').replace(/\\;/g,';').trim();
+  if(meta.includes('QUOTED-PRINTABLE')) val=decodeQP(val);
+  return val.replace(/\s+/g,' ').trim();
+}
+function parseVCF(txt){
+  txt=unfoldVcf(txt);
+  const cards=txt.match(/BEGIN:VCARD[\s\S]*?END:VCARD/gi)||[];
+  const rows=[];
+  for(const raw of cards){
+    const card=raw.replace(/BEGIN:VCARD|END:VCARD/gi,'');
+    const lines=card.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    let nome='', email='', org='', tels=[];
+    for(const line of lines){
+      const key=line.split(':')[0].toUpperCase();
+      if(key.startsWith('FN')) nome=cleanVcfValue(line);
+      else if(key.startsWith('ORG')&&!org) org=cleanVcfValue(line);
+      else if(!nome && key.startsWith('N')){
+        const partes=cleanVcfValue(line).split(';').map(x=>x.trim()).filter(Boolean);
+        nome=partes.slice(0,3).reverse().join(' ').trim()||partes.join(' ').trim();
+      }
+      else if(key.startsWith('TEL')){
+        let t=cleanVcfValue(line).replace(/^N(?=\d)/i,'');
+        t=onlyDigits(t);
+        if(t && t.length>=8 && !tels.includes(t)) tels.push(t);
+      }
+      else if(key.startsWith('EMAIL')&&!email) email=cleanVcfValue(line);
+    }
+    nome=(nome||org||tels[0]||'').replace(/^\.+$/,'').trim();
+    if(tels.length){
+      const tel=tels[0];
+      rows.push({nome:nome||tel,telefone:tel,whatsapp:tel,email,observacoes:'IMPORTADO VCF'});
+    }
+  }
+  return rows;
+}
+function parseContatosArquivo(file){
+  const name=String(file.originalname||'').toLowerCase();
+  const mime=String(file.mimetype||'').toLowerCase();
+  if(name.endsWith('.zip')||mime.includes('zip')){
+    const zip=new AdmZip(file.buffer);
+    let rows=[];
+    for(const e of zip.getEntries()){
+      if(e.isDirectory) continue;
+      const n=e.entryName.toLowerCase();
+      const text=decodeTextBuffer(e.getData());
+      if(n.endsWith('.vcf')||text.includes('BEGIN:VCARD')) rows=rows.concat(parseVCF(text));
+      else if(n.endsWith('.csv')||n.endsWith('.txt')) rows=rows.concat(text.includes('BEGIN:VCARD')?parseVCF(text):parseCSV(text));
+    }
+    return rows;
+  }
+  const txt=decodeTextBuffer(file.buffer);
+  if(name.endsWith('.vcf')||name.endsWith('.txt')||txt.includes('BEGIN:VCARD')) return txt.includes('BEGIN:VCARD')?parseVCF(txt):parseCSV(txt);
+  return parseCSV(txt);
 }
 async function getLogo(){return await getConfig('empresa')||{};}
 app.get('/api/config/empresa',async(_,res)=>{try{if(!db(res))return; ok(res,await getLogo())}catch(e){fail(res,e)}});
 app.post('/api/config/empresa',upload.single('logo'),async(req,res)=>{try{if(!db(res))return; const atual=await getLogo(); const body=normalize(req.body||{}); if(req.file){body.logo_data='data:'+req.file.mimetype+';base64,'+req.file.buffer.toString('base64'); body.logo_nome=req.file.originalname;} ok(res,await setConfig('empresa',{...atual,...body}))}catch(e){fail(res,e)}});
 app.get('/api/clientes/exportar',async(_,res)=>{try{if(!db(res))return; const {data,error}=await supabase.from('clientes').select('*').order('nome'); if(error)throw error; const cols=['nome','telefone','whatsapp','email','cpf_cnpj','rua','numero','complemento','bairro','cidade','estado','cep','observacoes']; const csv=[cols.join(';')].concat((data||[]).map(r=>cols.map(c=>csvEscape(r[c])).join(';'))).join('\n'); res.setHeader('Content-Type','text/csv; charset=utf-8'); res.setHeader('Content-Disposition','attachment; filename="clientes-confeitaria-olitech.csv"'); res.send('\ufeff'+csv)}catch(e){fail(res,e)}});
-app.post('/api/clientes/importar',upload.single('arquivo'),async(req,res)=>{try{if(!db(res))return; if(!req.file)throw new Error('Selecione CSV exportado dos contatos do celular.'); const rows=parseCSV(req.file.buffer.toString('utf8')); let okCount=0; for(const r of rows){ const nome=upper(r.nome||r.name||r['display name']||r.cliente); const tel=r.whatsapp||r.telefone||r.phone||r['mobile phone']||r.celular||''; if(!nome&&!tel) continue; const row=normalize({nome:nome||tel,telefone:tel,whatsapp:tel,email:r.email||r['e-mail']||'',cpf_cnpj:r.cpf_cnpj||r.cnpj||r.cpf||'',rua:r.rua||r.endereco||'',numero:r.numero||'',bairro:r.bairro||'',cidade:r.cidade||'',estado:r.estado||'',cep:r.cep||'',observacoes:r.observacoes||'IMPORTADO'}); const existing=onlyDigits(tel); let q=supabase.from('clientes').select('id').limit(1); if(existing) q=q.or(`telefone.ilike.%${existing}%,whatsapp.ilike.%${existing}%`); else q=q.eq('nome',row.nome); const e=await q.maybeSingle(); if(e.data?.id) row.id=e.data.id; const ins=await supabase.from('clientes').upsert(row).select().single(); if(!ins.error) okCount++; } ok(res,{importados:okCount,total:rows.length})}catch(e){fail(res,e)}});
+app.post('/api/clientes/importar',upload.single('arquivo'),async(req,res)=>{try{if(!db(res))return; if(!req.file)throw new Error('Selecione arquivo CSV, VCF ou ZIP exportado dos contatos do celular.'); const rows=parseContatosArquivo(req.file); let okCount=0, atualizados=0, ignorados=0; for(const r of rows){ const nome=upper(r.nome||r.name||r['display name']||r.cliente||r.fn); const tel=r.whatsapp||r.telefone||r.phone||r['mobile phone']||r.celular||r.tel||''; const telDigits=onlyDigits(tel); if(!nome&&!telDigits){ignorados++; continue;} const telFinal=telDigits?('+'+telDigits):''; const row=normalize({nome:nome||telFinal,telefone:telFinal,whatsapp:telFinal,email:r.email||r['e-mail']||'',cpf_cnpj:r.cpf_cnpj||r.cnpj||r.cpf||'',rua:r.rua||r.endereco||'',numero:r.numero||'',bairro:r.bairro||'',cidade:r.cidade||'',estado:r.estado||'',cep:r.cep||'',observacoes:r.observacoes||'IMPORTADO'}); let q=supabase.from('clientes').select('id').limit(1); if(telDigits){ const sem55=telDigits.replace(/^55/,''); q=q.or(`telefone.ilike.%${telDigits}%,whatsapp.ilike.%${telDigits}%,telefone.ilike.%${sem55}%,whatsapp.ilike.%${sem55}%`); } else q=q.eq('nome',row.nome); const e=await q.maybeSingle(); if(e.data?.id){ row.id=e.data.id; atualizados++; } const ins=await supabase.from('clientes').upsert(row).select().single(); if(!ins.error) okCount++; else ignorados++; } ok(res,{importados:okCount,atualizados,novos:Math.max(okCount-atualizados,0),ignorados,total:rows.length})}catch(e){fail(res,e)}});
 app.post('/api/vendas/cancelar/:id',async(req,res)=>{try{if(!db(res))return; const {motivo='CANCELADA'}=normalize(req.body||{}); const {data,error}=await supabase.from('vendas').update({status:'CANCELADA',motivo_cancelamento:motivo,cancelada_em:new Date().toISOString()}).eq('id',req.params.id).select().single(); if(error)throw error; ok(res,data)}catch(e){fail(res,e)}});
 app.get('/api/formas-pagamento',async(_,res)=>{try{if(!db(res))return; const c=await getConfig('formas_pagamento'); ok(res,c?.formas||['DINHEIRO','PIX','DÉBITO','CRÉDITO','CREDIÁRIO'])}catch(e){fail(res,e)}});
 app.post('/api/formas-pagamento',async(req,res)=>{try{if(!db(res))return; let formas=(req.body.formas||[]).map(upper).filter(Boolean); if(!formas.length) formas=['DINHEIRO','PIX','DÉBITO','CRÉDITO','CREDIÁRIO']; ok(res,await setConfig('formas_pagamento',{formas}))}catch(e){fail(res,e)}});
@@ -181,4 +268,4 @@ app.use((req,res,next)=>{
   if(req.path.startsWith('/api/')) return next();
   res.sendFile(__dirname+'/public/index.html');
 });
-app.listen(PORT,()=>console.log('CONFEITARIA OLITECH ERP V5.5 ON '+PORT));
+app.listen(PORT,()=>console.log('CONFEITARIA OLITECH ERP V5.8 ON '+PORT));

@@ -1,6 +1,6 @@
 {
   "name": "confeitaria-olitech-erp",
-  "version": "5.6.0",
+  "version": "5.7.0",
   "description": "ERP Confeitaria Olitech",
   "main": "server.js",
   "scripts": {
@@ -13,7 +13,8 @@
     "dotenv": "16.4.5",
     "express": "4.18.3",
     "multer": "1.4.5-lts.1",
-    "pdf-parse": "1.1.1"
+    "pdf-parse": "1.1.1",
+    "adm-zip": "0.5.16"
   },
   "engines": {
     "node": "20.20.2",
